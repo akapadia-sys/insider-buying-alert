@@ -1,0 +1,32 @@
+name: Insider Buying Alert
+
+on:
+  schedule:
+    # Runs at 11:00 PM UTC every weekday (Mon-Fri)
+    # That's roughly 7 PM ET / 4 PM PT (after market close)
+    - cron: '0 23 * * 1-5'
+  workflow_dispatch:  # Lets you run it manually for testing
+
+jobs:
+  send-alert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests lxml
+
+      - name: Run insider alert script
+        run: python insider_alert.py
+        env:
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          MIN_PURCHASE_USD: "250000"
+          EDGAR_USER_AGENT: "InsiderBuyingAlert/1.0 (insider-alert@users.noreply.github.com)"
