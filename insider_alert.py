@@ -381,7 +381,7 @@ def main():
     log.info(f"Min purchase threshold: ${MIN_PURCHASE_USD:,.0f}")
 
     # Fetch yesterday's + today's filings (filings can appear with a lag)
-    filings = fetch_recent_form4_index(lookback_days=1)
+    filings = fetch_recent_form4_index(lookback_days=3)
 
     if not filings:
         log.info("No Form 4 filings found in index. Sending empty digest.")
