@@ -1,343 +1,241 @@
 """
 Daily Insider Open-Market Purchase Alert Agent
 ================================================
-Pulls SEC EDGAR Form 4 filings, parses for open-market purchases
-by insiders, and emails a daily digest via Gmail.
+Scrapes OpenInsider.com for recent sizeable open-market purchases
+by company insiders and emails a daily digest via Gmail.
 
-Data flow:
-  1. Use EDGAR company submissions API to get recent Form 4 accessions
-  2. Fetch each filing's index page to find the XML document
-  3. Parse the XML for transaction code "P" (open-market purchase)
-  4. Filter by dollar threshold, build HTML email, send via Gmail
+OpenInsider aggregates SEC Form 4 data into clean HTML tables,
+which is far more reliable than parsing raw EDGAR XML.
 
 Setup:
-  1. pip install requests
+  1. pip install requests beautifulsoup4
   2. Set environment variables (see CONFIG section)
   3. Run daily via cron or GitHub Actions
 """
 
 import os
 import sys
-import re
-import json
 import time
 import smtplib
 import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta, timezone
-from xml.etree import ElementTree as ET
 from typing import Optional
 import requests
+from bs4 import BeautifulSoup
 
 # ──────────────────────────────────────────────
-# CONFIG — set via environment variables
+# CONFIG
 # ──────────────────────────────────────────────
 GMAIL_ADDRESS    = os.environ.get("GMAIL_ADDRESS", "you@gmail.com")
 GMAIL_APP_PASS   = os.environ.get("GMAIL_APP_PASSWORD", "")
 RECIPIENT_EMAIL  = os.environ.get("RECIPIENT_EMAIL", GMAIL_ADDRESS)
 MIN_PURCHASE_USD = float(os.environ.get("MIN_PURCHASE_USD", "250000"))
 
-# IMPORTANT: SEC requires a real name + email in the User-Agent.
-# Format: "CompanyOrName AdminEmail"   e.g. "MyFirm john@example.com"
-EDGAR_USER_AGENT = os.environ.get("EDGAR_USER_AGENT", "InsiderAlert admin@example.com")
-
-REQUEST_DELAY = 0.12  # SEC rate limit: max 10 req/sec
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": EDGAR_USER_AGENT,
-    "Accept-Encoding": "gzip, deflate",
-    "Accept": "application/json, text/html, application/xml, */*",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 })
 
 
 # ──────────────────────────────────────────────
-# 1. FETCH RECENT FORM 4 FILINGS
-#    Using EDGAR full-text search (EFTS) API
-#    Docs: https://efts.sec.gov/LATEST/
+# 1. FETCH INSIDER PURCHASES FROM OPENINSIDER
 # ──────────────────────────────────────────────
-def fetch_form4_filings(lookback_days: int = 3) -> list[dict]:
+def fetch_insider_purchases(lookback_days: int = 3) -> list[dict]:
     """
-    Uses EDGAR's EFTS full-text search API to find recent Form 4 filings.
-    Endpoint: https://efts.sec.gov/LATEST/search-index
-    Returns list of dicts with accession_no, cik, entity_name, file_date.
+    Scrapes OpenInsider.com for recent open-market purchases.
+    Uses their screener with filters for:
+      - Transaction type: P (Purchase)
+      - Min transaction value
+      - Recent filing date
     """
     now = datetime.now(timezone.utc)
-    start_date = (now - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-    end_date = now.strftime("%Y-%m-%d")
+    start_date = (now - timedelta(days=lookback_days)).strftime("%m/%d/%Y")
+    end_date = now.strftime("%m/%d/%Y")
 
-    # The documented EFTS endpoint
-    url = "https://efts.sec.gov/LATEST/search-index"
-    params = {
-        "q": '"4"',
-        "forms": "4",
-        "dateRange": "custom",
-        "startdt": start_date,
-        "enddt": end_date,
-    }
+    # OpenInsider screener URL for open-market purchases
+    # cnt=500 gets up to 500 results
+    url = (
+        f"http://openinsider.com/screener?"
+        f"s=&o=&pl=&ph=&st=1&td=0&tdr=&fdlyl=&fdlyh="
+        f"&dtefrom={start_date}&dteto={end_date}"
+        f"&xp=1&vl={int(MIN_PURCHASE_USD)}&vh="
+        f"&ocl=&och=&session=1&sic1=-1&sicl=100&sich=9999"
+        f"&grp=0&nfl=&nfh=&nil=&nih=&nol=&noh=&v2l=&v2h="
+        f"&oc2l=&oc2h=&sortcol=0&cnt=500&page=1"
+    )
 
-    log.info(f"Trying EFTS search: {url}")
+    log.info(f"Fetching purchases from OpenInsider (last {lookback_days} days, >= ${MIN_PURCHASE_USD:,.0f})...")
+    log.info(f"URL: {url}")
+
     try:
-        resp = SESSION.get(url, params=params, timeout=30)
-        time.sleep(REQUEST_DELAY)
-        log.info(f"EFTS response: HTTP {resp.status_code}")
-        if resp.status_code == 200:
-            data = resp.json()
-            hits = data.get("hits", {}).get("hits", [])
-            log.info(f"EFTS returned {len(hits)} hits")
-            return hits
-    except Exception as e:
-        log.warning(f"EFTS search failed: {e}")
-
-    return []
-
-
-def fetch_form4_via_full_index(lookback_days: int = 3) -> list[dict]:
-    """
-    Fallback: Download EDGAR daily full-index master files to find Form 4s.
-    These are plain text files with one line per filing.
-    URL format: https://www.sec.gov/Archives/edgar/full-index/YYYY/QTRN/master.idx
-    """
-    now = datetime.now(timezone.utc)
-    filings = []
-
-    for day_offset in range(lookback_days + 1):
-        d = now - timedelta(days=day_offset)
-        quarter = (d.month - 1) // 3 + 1
-
-        # Try the daily master file first
-        # Format varies: master.YYYYMMDD.idx or just in the full master.idx
-        # The full master.idx for the quarter contains ALL filings
-        # For daily, EDGAR provides files at:
-        #   /Archives/edgar/daily-index/YYYY/QTRN/master.YYYYMMDD.idx
-        daily_url = (
-            f"https://www.sec.gov/Archives/edgar/daily-index/"
-            f"{d.year}/QTR{quarter}/master.{d.strftime('%Y%m%d')}.idx"
-        )
-
-        log.info(f"Fetching daily index: {daily_url}")
-        try:
-            resp = SESSION.get(daily_url, timeout=30)
-            time.sleep(REQUEST_DELAY)
-            if resp.status_code == 200:
-                for line in resp.text.splitlines():
-                    # Format: CIK|Company Name|Form Type|Date Filed|Filename
-                    parts = line.split("|")
-                    if len(parts) == 5 and parts[2].strip() in ("4", "4/A"):
-                        filings.append({
-                            "cik": parts[0].strip(),
-                            "company_name": parts[1].strip(),
-                            "form_type": parts[2].strip(),
-                            "date_filed": parts[3].strip(),
-                            "filename": parts[4].strip(),
-                        })
-                log.info(f"  Found {len([p for p in filings if p['date_filed'] == d.strftime('%Y-%m-%d')])} Form 4s for {d.strftime('%Y-%m-%d')}")
-            else:
-                log.info(f"  No daily index for {d.strftime('%Y-%m-%d')} (HTTP {resp.status_code})")
-        except Exception as e:
-            log.warning(f"  Error fetching daily index: {e}")
-
-    log.info(f"Full-index method found {len(filings)} total Form 4 filings")
-    return filings
-
-
-# ──────────────────────────────────────────────
-# 2. RESOLVE XML URLS FROM FILING METADATA
-# ──────────────────────────────────────────────
-def resolve_xml_url_from_index_entry(filing: dict) -> Optional[str]:
-    """
-    Given a filing from the daily index, construct the filing index page URL
-    and find the XML document.
-
-    The filename field looks like: edgar/data/789019/0001062993-26-003456.txt
-    We need: https://www.sec.gov/Archives/edgar/data/789019/000106299326003456/0001062993-26-003456-index.htm
-    """
-    filename = filing.get("filename", "")
-    if not filename:
-        return None
-
-    # Build the full URL to the txt filing
-    base = "https://www.sec.gov/Archives/"
-
-    # Extract accession number from filename
-    # e.g., edgar/data/789019/0001062993-26-003456.txt
-    parts = filename.split("/")
-    if len(parts) < 4:
-        return None
-
-    cik = parts[2]
-    txt_name = parts[3]  # 0001062993-26-003456.txt
-    accession_dashed = txt_name.replace(".txt", "")
-    accession_nodash = accession_dashed.replace("-", "")
-
-    # Filing index page URL
-    idx_url = f"{base}edgar/data/{cik}/{accession_nodash}/{accession_dashed}-index.htm"
-
-    return _find_xml_on_index_page(idx_url, f"{base}edgar/data/{cik}/{accession_nodash}")
-
-
-def _find_xml_on_index_page(idx_url: str, folder_url: str) -> Optional[str]:
-    """Fetch a filing index page and extract the primary XML document URL."""
-    try:
-        resp = SESSION.get(idx_url, timeout=30)
-        time.sleep(REQUEST_DELAY)
-
+        resp = SESSION.get(url, timeout=30)
         if resp.status_code != 200:
-            log.debug(f"Index page HTTP {resp.status_code}: {idx_url}")
-            return None
-
-        # Look for XML file links in the index page
-        xml_links = re.findall(r'href="([^"]+\.xml)"', resp.text, re.IGNORECASE)
-
-        if not xml_links:
-            # Sometimes the XML is referenced differently
-            # Try looking for any .xml reference in the page
-            xml_links = re.findall(r'([^\s"<>]+\.xml)', resp.text, re.IGNORECASE)
-
-        for link in xml_links:
-            basename = link.rsplit("/", 1)[-1] if "/" in link else link
-            # Skip R_ files (XBRL rendering files) and FilingSummary
-            if basename.lower().startswith("r_"):
-                continue
-            if "filingsummary" in basename.lower():
-                continue
-            if link.startswith("http"):
-                return link
-            if link.startswith("/"):
-                return f"https://www.sec.gov{link}"
-            return f"{folder_url}/{link}"
-
+            log.error(f"OpenInsider returned HTTP {resp.status_code}")
+            return []
     except Exception as e:
-        log.debug(f"Error fetching index page: {e}")
-    return None
+        log.error(f"Failed to fetch OpenInsider: {e}")
+        return []
+
+    return parse_openinsider_table(resp.text)
 
 
-# ──────────────────────────────────────────────
-# 3. PARSE FORM 4 XML FOR PURCHASE DETAILS
-# ──────────────────────────────────────────────
-def parse_form4_xml(xml_url: str) -> Optional[dict]:
+def parse_openinsider_table(html: str) -> list[dict]:
     """
-    Downloads and parses a Form 4 XML filing.
-    Returns purchase info if it contains open-market purchases
-    above the minimum threshold. Returns None otherwise.
+    Parses the OpenInsider screener results table.
+    Columns (typical order):
+      X, Filing Date, Trade Date, Ticker, Insider Name, Title,
+      Trade Type, Price, Qty, Owned, Delta Own, Value, ...
     """
-    try:
-        resp = SESSION.get(xml_url, timeout=30)
-        time.sleep(REQUEST_DELAY)
-        if resp.status_code != 200:
-            return None
+    soup = BeautifulSoup(html, "html.parser")
 
-        content = resp.content
-        # Strip XML namespaces that can break ElementTree
-        try:
-            root = ET.fromstring(content)
-        except ET.ParseError:
-            clean = re.sub(rb'\sxmlns[^"]*"[^"]*"', b'', content)
-            try:
-                root = ET.fromstring(clean)
-            except ET.ParseError:
-                return None
-    except Exception as e:
-        log.debug(f"Failed to fetch/parse {xml_url}: {e}")
-        return None
+    # Find the main results table — it's the one with class "tinytable"
+    table = soup.find("table", class_="tinytable")
+    if not table:
+        # Try finding any table with insider data
+        tables = soup.find_all("table")
+        for t in tables:
+            if t.find("a", href=lambda h: h and "/screener?" in h if h else False):
+                continue
+            headers = [th.get_text(strip=True).lower() for th in t.find_all("th")]
+            if any("ticker" in h for h in headers):
+                table = t
+                break
 
-    # --- Issuer (company) info ---
-    issuer_name = _text(root, ".//issuerName") or _text(root, ".//issuer/issuerName")
-    issuer_ticker = _text(root, ".//issuerTradingSymbol") or _text(root, ".//issuer/issuerTradingSymbol")
-    issuer_cik = _text(root, ".//issuerCik") or _text(root, ".//issuer/issuerCik")
+    if not table:
+        log.error("Could not find results table on OpenInsider page")
+        log.info(f"Page length: {len(html)} chars")
+        # Log first 500 chars for debugging
+        log.info(f"Page preview: {html[:500]}")
+        return []
 
-    if not issuer_name:
-        return None
+    # Parse header row to determine column indices
+    header_row = table.find("tr")
+    if not header_row:
+        log.error("No header row found in table")
+        return []
 
-    # --- Reporting owner (insider) info ---
-    owner_name = _text(root, ".//rptOwnerName") or _text(root, ".//reportingOwner//rptOwnerName")
+    headers = []
+    for th in header_row.find_all(["th", "td"]):
+        headers.append(th.get_text(strip=True).lower())
 
-    rel = root.find(".//reportingOwnerRelationship")
-    is_director = _text(rel, "isDirector") in ("1", "true") if rel is not None else False
-    is_officer = _text(rel, "isOfficer") in ("1", "true") if rel is not None else False
-    is_ten_pct = _text(rel, "isTenPercentOwner") in ("1", "true") if rel is not None else False
-    officer_title = _text(rel, "officerTitle") if rel is not None else ""
+    log.info(f"Table headers: {headers}")
 
-    roles = []
-    if is_officer and officer_title:
-        roles.append(officer_title)
-    elif is_officer:
-        roles.append("Officer")
-    if is_director:
-        roles.append("Director")
-    if is_ten_pct:
-        roles.append("10%+ Owner")
-    role_str = ", ".join(roles) if roles else "Insider"
+    # Map column names to indices (OpenInsider uses varying header names)
+    col_map = {}
+    for i, h in enumerate(headers):
+        h_clean = h.replace("\xa0", " ").strip().lower()
+        if "filing" in h_clean and "date" in h_clean:
+            col_map["filing_date"] = i
+        elif "trade" in h_clean and "date" in h_clean:
+            col_map["trade_date"] = i
+        elif "ticker" in h_clean:
+            col_map["ticker"] = i
+        elif "insider" in h_clean and "name" in h_clean:
+            col_map["insider_name"] = i
+        elif "title" in h_clean:
+            col_map["title"] = i
+        elif "price" in h_clean:
+            col_map["price"] = i
+        elif h_clean in ("qty", "shares"):
+            col_map["qty"] = i
+        elif "value" in h_clean:
+            col_map["value"] = i
+        elif "company" in h_clean:
+            col_map["company"] = i
 
-    # --- Non-derivative transactions: look for code "P" (purchase) ---
+    log.info(f"Column mapping: {col_map}")
+
+    # Parse data rows
     purchases = []
-    for txn in root.findall(".//nonDerivativeTransaction"):
-        code = _text(txn, ".//transactionCode") or _text(txn, ".//transactionCoding/transactionCode")
-        if code != "P":
-            continue
+    rows = table.find_all("tr")[1:]  # skip header
 
-        acq_disp = (
-            _text(txn, ".//transactionAcquiredDisposedCode/value")
-            or _text(txn, ".//transactionAcquiredDisposedCode")
-        )
-        if acq_disp and acq_disp != "A":
+    for row in rows:
+        cells = row.find_all("td")
+        if len(cells) < 5:
             continue
-
-        shares_str = _text(txn, ".//transactionShares/value") or _text(txn, ".//transactionShares")
-        price_str = _text(txn, ".//transactionPricePerShare/value") or _text(txn, ".//transactionPricePerShare")
-        date_str = _text(txn, ".//transactionDate/value") or _text(txn, ".//transactionDate")
 
         try:
-            shares = float(shares_str) if shares_str else 0
-            price = float(price_str) if price_str else 0
-        except ValueError:
-            continue
+            # Extract ticker — often in a link
+            ticker_idx = col_map.get("ticker", 3)
+            ticker_cell = cells[ticker_idx] if ticker_idx < len(cells) else None
+            if ticker_cell:
+                link = ticker_cell.find("a")
+                ticker = link.get_text(strip=True) if link else ticker_cell.get_text(strip=True)
+            else:
+                continue
 
-        total_value = shares * price
+            # Extract other fields
+            insider_name = _cell_text(cells, col_map.get("insider_name", 4))
+            title = _cell_text(cells, col_map.get("title", 5))
+            trade_date = _cell_text(cells, col_map.get("trade_date", 2))
+            filing_date = _cell_text(cells, col_map.get("filing_date", 1))
 
-        if total_value >= MIN_PURCHASE_USD:
+            # Price and value — strip $, commas, +, etc.
+            price_str = _cell_text(cells, col_map.get("price", 7))
+            value_str = _cell_text(cells, col_map.get("value", 11))
+            qty_str = _cell_text(cells, col_map.get("qty", 8))
+
+            price = _parse_number(price_str)
+            value = _parse_number(value_str)
+            qty = _parse_number(qty_str)
+
+            # If we have qty and price but not value, calculate it
+            if value == 0 and qty > 0 and price > 0:
+                value = qty * price
+
+            if value < MIN_PURCHASE_USD:
+                continue
+
+            # Get company name if available
+            company = _cell_text(cells, col_map.get("company", -1))
+
             purchases.append({
-                "date": date_str,
-                "shares": shares,
-                "price": price,
-                "total_value": total_value,
+                "ticker": ticker.upper().strip(),
+                "issuer_name": company or ticker,
+                "owner_name": insider_name,
+                "role": title,
+                "trade_date": trade_date,
+                "filing_date": filing_date,
+                "total_shares": qty,
+                "avg_price": price,
+                "total_invested": value,
+                "sec_url": f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&company={ticker}&CIK=&type=4&dateb=&owner=include&count=10&search_text=&action=getcompany",
             })
 
-    if not purchases:
-        return None
+        except Exception as e:
+            log.debug(f"Error parsing row: {e}")
+            continue
 
-    total_invested = sum(p["total_value"] for p in purchases)
-    total_shares = sum(p["shares"] for p in purchases)
-    avg_price = total_invested / total_shares if total_shares else 0
-
-    return {
-        "issuer_name": issuer_name,
-        "ticker": issuer_ticker.upper() if issuer_ticker else "N/A",
-        "issuer_cik": issuer_cik,
-        "owner_name": owner_name,
-        "role": role_str,
-        "purchases": purchases,
-        "total_invested": total_invested,
-        "total_shares": total_shares,
-        "avg_price": avg_price,
-        "filing_url": xml_url,
-    }
+    log.info(f"Parsed {len(purchases)} qualifying purchases from OpenInsider")
+    return purchases
 
 
-def _text(el, path: str) -> str:
-    """Safely extract text from an XML element."""
-    if el is None:
+def _cell_text(cells: list, idx: int) -> str:
+    """Safely get text from a table cell by index."""
+    if idx < 0 or idx >= len(cells):
         return ""
-    child = el.find(path)
-    return (child.text or "").strip() if child is not None else ""
+    return cells[idx].get_text(strip=True)
+
+
+def _parse_number(s: str) -> float:
+    """Parse a number string, removing $, commas, +, and other formatting."""
+    if not s:
+        return 0
+    cleaned = s.replace("$", "").replace(",", "").replace("+", "").replace(" ", "").strip()
+    try:
+        return abs(float(cleaned))
+    except ValueError:
+        return 0
 
 
 # ──────────────────────────────────────────────
-# 4. BUILD + SEND EMAIL DIGEST
+# 2. BUILD + SEND EMAIL DIGEST
 # ──────────────────────────────────────────────
 def build_email_html(trades: list[dict], date_str: str) -> str:
     """Build a clean HTML email digest."""
@@ -367,13 +265,15 @@ def build_email_html(trades: list[dict], date_str: str) -> str:
             <td style="padding: 10px; text-align: right;">${t['avg_price']:,.2f}</td>
             <td style="padding: 10px; text-align: right; font-weight: bold; color: #27ae60;">
                 ${t['total_invested']:,.0f}</td>
+            <td style="padding: 10px; text-align: center; font-size: 12px; color: #777;">
+                {t.get('trade_date', '')}</td>
         </tr>
         """
 
     total_all = sum(t["total_invested"] for t in trades)
 
     return f"""
-    <html><body style="font-family: Arial, sans-serif; color: #333; max-width: 750px; margin: auto;">
+    <html><body style="font-family: Arial, sans-serif; color: #333; max-width: 800px; margin: auto;">
     <h2 style="color: #1a5276; border-bottom: 3px solid #2980b9; padding-bottom: 8px;">
         Insider Buying Digest &mdash; {date_str}</h2>
     <p style="color: #555;">
@@ -387,14 +287,15 @@ def build_email_html(trades: list[dict], date_str: str) -> str:
                 <th style="padding: 10px; text-align: left;">Ticker</th>
                 <th style="padding: 10px; text-align: left;">Insider</th>
                 <th style="padding: 10px; text-align: right;">Shares</th>
-                <th style="padding: 10px; text-align: right;">Avg Price</th>
+                <th style="padding: 10px; text-align: right;">Price</th>
                 <th style="padding: 10px; text-align: right;">Total Value</th>
+                <th style="padding: 10px; text-align: center;">Trade Date</th>
             </tr>
         </thead>
         <tbody>{rows}</tbody>
     </table>
     <p style="font-size: 11px; color: #aaa; margin-top: 20px;">
-        Source: SEC EDGAR Form 4 filings. Open-market purchases only (code &ldquo;P&rdquo;).
+        Source: SEC Form 4 filings via OpenInsider.com. Open-market purchases only.
         This is not investment advice.</p>
     </body></html>
     """
@@ -423,90 +324,28 @@ def send_email(html_body: str, date_str: str):
 
 
 # ──────────────────────────────────────────────
-# 5. MAIN PIPELINE
+# 3. MAIN
 # ──────────────────────────────────────────────
 def main():
     log.info("=== Insider Buying Alert Agent ===")
     log.info(f"Min purchase threshold: ${MIN_PURCHASE_USD:,.0f}")
-    log.info(f"User-Agent: {EDGAR_USER_AGENT}")
 
-    # ── Step 1: Get Form 4 filing list from daily index files ──
-    # This is the most reliable method — plain text files, no API auth needed
-    filings = fetch_form4_via_full_index(lookback_days=3)
+    purchases = fetch_insider_purchases(lookback_days=3)
 
-    if not filings:
-        log.warning("Daily index returned no filings. Trying EFTS search as fallback...")
-        efts_hits = fetch_form4_filings(lookback_days=3)
-        # Convert EFTS hits to a common format for processing
-        for hit in efts_hits:
-            src = hit.get("_source", {})
-            acc = src.get("accession_no", "")
-            cik = str(src.get("cik", "")).lstrip("0")
-            if acc and cik:
-                acc_nodash = acc.replace("-", "")
-                filings.append({
-                    "cik": cik,
-                    "company_name": src.get("entity_name", ""),
-                    "form_type": "4",
-                    "date_filed": src.get("file_date", ""),
-                    "filename": f"edgar/data/{cik}/{acc}.txt",
-                })
-
-    if not filings:
-        log.info("No Form 4 filings found from any source. Sending empty digest.")
-        date_str = datetime.now(timezone.utc).strftime("%B %d, %Y")
-        send_email(build_email_html([], date_str), date_str)
-        return
-
-    # ── Step 2: Resolve XML URLs from filing index pages ──
-    log.info(f"Resolving XML URLs for {len(filings)} Form 4 filings...")
-    xml_urls = []
-    for i, f in enumerate(filings):
-        xml_url = resolve_xml_url_from_index_entry(f)
-        if xml_url:
-            xml_urls.append(xml_url)
-        else:
-            log.debug(f"No XML found for {f.get('company_name', '?')} ({f.get('filename', '?')})")
-
-        if (i + 1) % 100 == 0:
-            log.info(f"  Resolved {i+1}/{len(filings)} filings → {len(xml_urls)} XMLs so far")
-
-    log.info(f"Resolved {len(xml_urls)} XML URLs from {len(filings)} filings")
-
-    if not xml_urls:
-        log.warning("Could not resolve any XML URLs. Sending empty digest.")
-        date_str = datetime.now(timezone.utc).strftime("%B %d, %Y")
-        send_email(build_email_html([], date_str), date_str)
-        return
-
-    # ── Step 3: Parse each XML for qualifying purchases ──
-    log.info(f"Parsing {len(xml_urls)} Form 4 XMLs for purchases >= ${MIN_PURCHASE_USD:,.0f}...")
-    insider_purchases = []
-    for i, url in enumerate(xml_urls):
-        result = parse_form4_xml(url)
-        if result:
-            insider_purchases.append(result)
-            log.info(f"  ✓ PURCHASE: {result['ticker']} | {result['owner_name']} | "
-                     f"{result['role']} | ${result['total_invested']:,.0f}")
-
-        if (i + 1) % 100 == 0:
-            log.info(f"  Parsed {i+1}/{len(xml_urls)}, "
-                     f"found {len(insider_purchases)} qualifying purchases...")
-
-    # ── Step 4: Deduplicate and send ──
+    # Deduplicate by (ticker, owner_name)
     seen = set()
     unique = []
-    for t in insider_purchases:
+    for t in purchases:
         key = (t["ticker"], t["owner_name"])
         if key not in seen:
             seen.add(key)
             unique.append(t)
-    insider_purchases = unique
+    purchases = unique
 
-    log.info(f"Total: {len(insider_purchases)} unique insider purchases >= ${MIN_PURCHASE_USD:,.0f}")
+    log.info(f"Total: {len(purchases)} unique insider purchases >= ${MIN_PURCHASE_USD:,.0f}")
 
     date_str = datetime.now(timezone.utc).strftime("%B %d, %Y")
-    html = build_email_html(insider_purchases, date_str)
+    html = build_email_html(purchases, date_str)
     send_email(html, date_str)
     log.info("Done!")
 
