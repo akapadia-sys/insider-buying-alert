@@ -20,7 +20,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install requests lxml
+        run: pip install requests beautifulsoup4
 
       - name: Run insider alert script
         run: python insider_alert.py
@@ -29,4 +29,3 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
           MIN_PURCHASE_USD: "250000"
-          EDGAR_USER_AGENT: "AkarisGlobal aman@akarisglobal.com"
