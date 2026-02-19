@@ -1,11 +1,8 @@
 """
 Daily Insider Open-Market Purchase Alert Agent
 ================================================
-Scrapes OpenInsider.com for recent sizeable open-market purchases
-by company insiders and emails a daily digest via Gmail.
-
-OpenInsider aggregates SEC Form 4 data into clean HTML tables,
-which is far more reliable than parsing raw EDGAR XML.
+Scrapes OpenInsider.com's latest insider purchases page,
+filters for sizeable open-market buys, and emails a daily digest.
 
 Setup:
   1. pip install requests beautifulsoup4
@@ -15,13 +12,11 @@ Setup:
 
 import os
 import sys
-import time
 import smtplib
 import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 import requests
 from bs4 import BeautifulSoup
 
@@ -44,175 +39,174 @@ SESSION.headers.update({
 
 
 # ──────────────────────────────────────────────
-# 1. FETCH INSIDER PURCHASES FROM OPENINSIDER
+# 1. FETCH + PARSE OPENINSIDER DATA
 # ──────────────────────────────────────────────
 def fetch_insider_purchases(lookback_days: int = 3) -> list[dict]:
     """
-    Scrapes OpenInsider.com for recent open-market purchases.
-    Uses their screener with filters for:
-      - Transaction type: P (Purchase)
-      - Min transaction value
-      - Recent filing date
+    Fetches the OpenInsider "latest insider purchases" page.
+    This is a known, stable URL that shows the most recent
+    open-market purchases filed with the SEC.
+    
+    URL: http://openinsider.com/latest-insider-purchases
     """
-    now = datetime.now(timezone.utc)
-    start_date = (now - timedelta(days=lookback_days)).strftime("%m/%d/%Y")
-    end_date = now.strftime("%m/%d/%Y")
+    # This page shows the ~100 most recent insider purchases
+    # No finicky screener parameters needed
+    urls_to_try = [
+        "http://openinsider.com/latest-insider-purchases",
+        "http://openinsider.com/screener?s=&o=&pl=&ph=&st=1&td=7&tdr=&fdlyl=&fdlyh=&dtefrom=&dteto=&xp=1&vl=&vh=&ocl=&och=&session=1&sic1=-1&sicl=100&sich=9999&grp=0&nfl=&nfh=&nil=&nih=&nol=&noh=&v2l=&v2h=&oc2l=&oc2h=&sortcol=0&cnt=500&page=1",
+    ]
 
-    # OpenInsider screener URL for open-market purchases
-    # cnt=500 gets up to 500 results
-    url = (
-        f"http://openinsider.com/screener?"
-        f"s=&o=&pl=&ph=&st=1&td=0&tdr=&fdlyl=&fdlyh="
-        f"&dtefrom={start_date}&dteto={end_date}"
-        f"&xp=1&vl={int(MIN_PURCHASE_USD)}&vh="
-        f"&ocl=&och=&session=1&sic1=-1&sicl=100&sich=9999"
-        f"&grp=0&nfl=&nfh=&nil=&nih=&nol=&noh=&v2l=&v2h="
-        f"&oc2l=&oc2h=&sortcol=0&cnt=500&page=1"
-    )
+    for url in urls_to_try:
+        log.info(f"Fetching: {url}")
+        try:
+            resp = SESSION.get(url, timeout=30)
+            if resp.status_code != 200:
+                log.warning(f"HTTP {resp.status_code} from {url}")
+                continue
+        except Exception as e:
+            log.warning(f"Request failed for {url}: {e}")
+            continue
 
-    log.info(f"Fetching purchases from OpenInsider (last {lookback_days} days, >= ${MIN_PURCHASE_USD:,.0f})...")
-    log.info(f"URL: {url}")
+        purchases = parse_openinsider_table(resp.text)
+        if purchases:
+            return purchases
+        log.warning(f"No purchases parsed from {url}, trying next...")
 
-    try:
-        resp = SESSION.get(url, timeout=30)
-        if resp.status_code != 200:
-            log.error(f"OpenInsider returned HTTP {resp.status_code}")
-            return []
-    except Exception as e:
-        log.error(f"Failed to fetch OpenInsider: {e}")
-        return []
-
-    return parse_openinsider_table(resp.text)
+    log.error("All sources failed")
+    return []
 
 
 def parse_openinsider_table(html: str) -> list[dict]:
     """
-    Parses the OpenInsider screener results table.
-    Columns (typical order):
-      X, Filing Date, Trade Date, Ticker, Insider Name, Title,
-      Trade Type, Price, Qty, Owned, Delta Own, Value, ...
+    Parses OpenInsider HTML for the insider transactions table.
+    
+    Known columns (with non-breaking spaces in headers):
+      X, Filing Date, Trade Date, Ticker, Company Name, Insider Name,
+      Title, Trade Type, Price, Qty, Owned, ΔOwn, Value, 1d, 1w, 1m, 6m
     """
     soup = BeautifulSoup(html, "html.parser")
 
-    # Find the main results table — it's the one with class "tinytable"
+    # Find the main results table — class "tinytable"
     table = soup.find("table", class_="tinytable")
+
     if not table:
-        # Try finding any table with insider data
-        tables = soup.find_all("table")
-        for t in tables:
-            if t.find("a", href=lambda h: h and "/screener?" in h if h else False):
-                continue
-            headers = [th.get_text(strip=True).lower() for th in t.find_all("th")]
-            if any("ticker" in h for h in headers):
+        # Fallback: find any table with "Ticker" in a header
+        for t in soup.find_all("table"):
+            header_text = " ".join(th.get_text() for th in t.find_all("th"))
+            if "Ticker" in header_text or "ticker" in header_text.lower():
                 table = t
                 break
 
     if not table:
-        log.error("Could not find results table on OpenInsider page")
-        log.info(f"Page length: {len(html)} chars")
-        # Log first 500 chars for debugging
-        log.info(f"Page preview: {html[:500]}")
+        log.error("Could not find data table on page")
+        # Log some page content for debugging
+        text = soup.get_text()[:1000]
+        log.info(f"Page text preview: {text}")
         return []
 
-    # Parse header row to determine column indices
-    header_row = table.find("tr")
-    if not header_row:
-        log.error("No header row found in table")
+    # Get all rows
+    rows = table.find_all("tr")
+    if len(rows) < 2:
+        log.error("Table has fewer than 2 rows")
         return []
 
-    headers = []
-    for th in header_row.find_all(["th", "td"]):
-        headers.append(th.get_text(strip=True).lower())
+    # Parse headers
+    header_cells = rows[0].find_all(["th", "td"])
+    headers = [c.get_text(strip=True).lower().replace("\xa0", " ") for c in header_cells]
+    log.info(f"Headers ({len(headers)}): {headers}")
 
-    log.info(f"Table headers: {headers}")
-
-    # Map column names to indices (OpenInsider uses varying header names)
-    col_map = {}
+    # Build column index map
+    col = {}
     for i, h in enumerate(headers):
-        h_clean = h.replace("\xa0", " ").strip().lower()
-        if "filing" in h_clean and "date" in h_clean:
-            col_map["filing_date"] = i
-        elif "trade" in h_clean and "date" in h_clean:
-            col_map["trade_date"] = i
-        elif "ticker" in h_clean:
-            col_map["ticker"] = i
-        elif "insider" in h_clean and "name" in h_clean:
-            col_map["insider_name"] = i
-        elif "title" in h_clean:
-            col_map["title"] = i
-        elif "price" in h_clean:
-            col_map["price"] = i
-        elif h_clean in ("qty", "shares"):
-            col_map["qty"] = i
-        elif "value" in h_clean:
-            col_map["value"] = i
-        elif "company" in h_clean:
-            col_map["company"] = i
+        if "filing" in h and "date" in h:
+            col["filing_date"] = i
+        elif "trade" in h and "date" in h:
+            col["trade_date"] = i
+        elif h == "ticker":
+            col["ticker"] = i
+        elif "company" in h:
+            col["company"] = i
+        elif "insider" in h:
+            col["insider"] = i
+        elif h == "title":
+            col["title"] = i
+        elif "trade" in h and "type" in h:
+            col["trade_type"] = i
+        elif h == "price":
+            col["price"] = i
+        elif h in ("qty", "shares"):
+            col["qty"] = i
+        elif h == "value":
+            col["value"] = i
 
-    log.info(f"Column mapping: {col_map}")
+    log.info(f"Column map: {col}")
+
+    # Verify we have the essential columns
+    required = ["ticker", "insider", "price", "value"]
+    missing = [r for r in required if r not in col]
+    if missing:
+        log.error(f"Missing required columns: {missing}")
+        log.info(f"Available: {list(col.keys())}")
+        return []
 
     # Parse data rows
     purchases = []
-    rows = table.find_all("tr")[1:]  # skip header
+    skipped_value = 0
+    skipped_type = 0
 
-    for row in rows:
+    for row in rows[1:]:
         cells = row.find_all("td")
-        if len(cells) < 5:
+        if len(cells) < len(headers) - 2:  # allow some slack
             continue
 
         try:
-            # Extract ticker — often in a link
-            ticker_idx = col_map.get("ticker", 3)
-            ticker_cell = cells[ticker_idx] if ticker_idx < len(cells) else None
-            if ticker_cell:
-                link = ticker_cell.find("a")
-                ticker = link.get_text(strip=True) if link else ticker_cell.get_text(strip=True)
-            else:
+            ticker = _cell_text(cells, col["ticker"]).upper().strip()
+            if not ticker:
                 continue
 
-            # Extract other fields
-            insider_name = _cell_text(cells, col_map.get("insider_name", 4))
-            title = _cell_text(cells, col_map.get("title", 5))
-            trade_date = _cell_text(cells, col_map.get("trade_date", 2))
-            filing_date = _cell_text(cells, col_map.get("filing_date", 1))
+            # Check trade type if available — we only want "P - Purchase"
+            if "trade_type" in col:
+                trade_type = _cell_text(cells, col["trade_type"]).upper().strip()
+                if trade_type and "P" not in trade_type:
+                    skipped_type += 1
+                    continue
 
-            # Price and value — strip $, commas, +, etc.
-            price_str = _cell_text(cells, col_map.get("price", 7))
-            value_str = _cell_text(cells, col_map.get("value", 11))
-            qty_str = _cell_text(cells, col_map.get("qty", 8))
+            insider = _cell_text(cells, col["insider"])
+            title = _cell_text(cells, col.get("title", -1))
+            company = _cell_text(cells, col.get("company", -1))
+            filing_date = _cell_text(cells, col.get("filing_date", -1))
+            trade_date = _cell_text(cells, col.get("trade_date", -1))
+            price = _parse_number(_cell_text(cells, col["price"]))
+            qty = _parse_number(_cell_text(cells, col.get("qty", -1)))
+            value = _parse_number(_cell_text(cells, col["value"]))
 
-            price = _parse_number(price_str)
-            value = _parse_number(value_str)
-            qty = _parse_number(qty_str)
-
-            # If we have qty and price but not value, calculate it
+            # Calculate value if missing
             if value == 0 and qty > 0 and price > 0:
                 value = qty * price
 
+            # Filter by minimum value
             if value < MIN_PURCHASE_USD:
+                skipped_value += 1
                 continue
 
-            # Get company name if available
-            company = _cell_text(cells, col_map.get("company", -1))
-
             purchases.append({
-                "ticker": ticker.upper().strip(),
+                "ticker": ticker,
                 "issuer_name": company or ticker,
-                "owner_name": insider_name,
+                "owner_name": insider,
                 "role": title,
                 "trade_date": trade_date,
                 "filing_date": filing_date,
                 "total_shares": qty,
                 "avg_price": price,
                 "total_invested": value,
-                "sec_url": f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&company={ticker}&CIK=&type=4&dateb=&owner=include&count=10&search_text=&action=getcompany",
             })
 
         except Exception as e:
             log.debug(f"Error parsing row: {e}")
             continue
 
-    log.info(f"Parsed {len(purchases)} qualifying purchases from OpenInsider")
+    log.info(f"Parsed {len(purchases)} purchases >= ${MIN_PURCHASE_USD:,.0f} "
+             f"(skipped {skipped_value} below threshold, {skipped_type} non-purchase)")
     return purchases
 
 
@@ -235,10 +229,9 @@ def _parse_number(s: str) -> float:
 
 
 # ──────────────────────────────────────────────
-# 2. BUILD + SEND EMAIL DIGEST
+# 2. EMAIL
 # ──────────────────────────────────────────────
 def build_email_html(trades: list[dict], date_str: str) -> str:
-    """Build a clean HTML email digest."""
     if not trades:
         return f"""
         <html><body style="font-family: Arial, sans-serif; color: #333;">
@@ -266,7 +259,7 @@ def build_email_html(trades: list[dict], date_str: str) -> str:
             <td style="padding: 10px; text-align: right; font-weight: bold; color: #27ae60;">
                 ${t['total_invested']:,.0f}</td>
             <td style="padding: 10px; text-align: center; font-size: 12px; color: #777;">
-                {t.get('trade_date', '')}</td>
+                {t.get('filing_date', '')}</td>
         </tr>
         """
 
@@ -289,7 +282,7 @@ def build_email_html(trades: list[dict], date_str: str) -> str:
                 <th style="padding: 10px; text-align: right;">Shares</th>
                 <th style="padding: 10px; text-align: right;">Price</th>
                 <th style="padding: 10px; text-align: right;">Total Value</th>
-                <th style="padding: 10px; text-align: center;">Trade Date</th>
+                <th style="padding: 10px; text-align: center;">Filed</th>
             </tr>
         </thead>
         <tbody>{rows}</tbody>
@@ -302,9 +295,8 @@ def build_email_html(trades: list[dict], date_str: str) -> str:
 
 
 def send_email(html_body: str, date_str: str):
-    """Send the digest email via Gmail SMTP."""
     if not GMAIL_APP_PASS:
-        log.error("GMAIL_APP_PASSWORD not set. Cannot send email.")
+        log.error("GMAIL_APP_PASSWORD not set.")
         sys.exit(1)
 
     msg = MIMEMultipart("alternative")
@@ -332,7 +324,26 @@ def main():
 
     purchases = fetch_insider_purchases(lookback_days=3)
 
-    # Deduplicate by (ticker, owner_name)
+    # Filter: only keep trades filed in the last 3 days
+    cutoff = datetime.now(timezone.utc) - timedelta(days=3)
+    filtered = []
+    for t in purchases:
+        fd = t.get("filing_date", "")
+        try:
+            filed_dt = datetime.strptime(fd, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            if filed_dt >= cutoff:
+                filtered.append(t)
+            else:
+                log.info(f"  Skipping (filed {fd}): {t['ticker']} | {t['owner_name']} | ${t['total_invested']:,.0f}")
+        except ValueError:
+            # Can't parse date — log it and include anyway
+            log.warning(f"  Unparseable filing date '{fd}' for {t['ticker']} | {t['owner_name']} — including")
+            filtered.append(t)
+    
+    log.info(f"After date filter: {len(filtered)} of {len(purchases)} purchases are from the last 3 days")
+    purchases = filtered
+
+    # Deduplicate
     seen = set()
     unique = []
     for t in purchases:
@@ -342,7 +353,12 @@ def main():
             unique.append(t)
     purchases = unique
 
-    log.info(f"Total: {len(purchases)} unique insider purchases >= ${MIN_PURCHASE_USD:,.0f}")
+    log.info(f"Final: {len(purchases)} unique purchases >= ${MIN_PURCHASE_USD:,.0f}")
+
+    # Log each one for debugging
+    for t in purchases:
+        log.info(f"  -> {t['ticker']} | {t['owner_name']} | {t['role']} | "
+                 f"${t['total_invested']:,.0f} | filed {t.get('filing_date','?')}")
 
     date_str = datetime.now(timezone.utc).strftime("%B %d, %Y")
     html = build_email_html(purchases, date_str)
