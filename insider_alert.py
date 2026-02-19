@@ -1,8 +1,14 @@
 """
 Daily Insider Open-Market Purchase Alert Agent
 ================================================
-Pulls SEC EDGAR Form 4 filings via the EFTS search API, parses the XML
-for open-market purchases by insiders, and emails a daily digest.
+Pulls SEC EDGAR Form 4 filings, parses for open-market purchases
+by insiders, and emails a daily digest via Gmail.
+
+Data flow:
+  1. Use EDGAR company submissions API to get recent Form 4 accessions
+  2. Fetch each filing's index page to find the XML document
+  3. Parse the XML for transaction code "P" (open-market purchase)
+  4. Filter by dollar threshold, build HTML email, send via Gmail
 
 Setup:
   1. pip install requests
@@ -19,7 +25,7 @@ import smtplib
 import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from xml.etree import ElementTree as ET
 from typing import Optional
 import requests
@@ -31,7 +37,10 @@ GMAIL_ADDRESS    = os.environ.get("GMAIL_ADDRESS", "you@gmail.com")
 GMAIL_APP_PASS   = os.environ.get("GMAIL_APP_PASSWORD", "")
 RECIPIENT_EMAIL  = os.environ.get("RECIPIENT_EMAIL", GMAIL_ADDRESS)
 MIN_PURCHASE_USD = float(os.environ.get("MIN_PURCHASE_USD", "250000"))
-EDGAR_USER_AGENT = os.environ.get("EDGAR_USER_AGENT", "InsiderBot/1.0 (you@gmail.com)")
+
+# IMPORTANT: SEC requires a real name + email in the User-Agent.
+# Format: "CompanyOrName AdminEmail"   e.g. "MyFirm john@example.com"
+EDGAR_USER_AGENT = os.environ.get("EDGAR_USER_AGENT", "InsiderAlert admin@example.com")
 
 REQUEST_DELAY = 0.12  # SEC rate limit: max 10 req/sec
 
@@ -39,297 +48,182 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": EDGAR_USER_AGENT, "Accept-Encoding": "gzip, deflate"})
+SESSION.headers.update({
+    "User-Agent": EDGAR_USER_AGENT,
+    "Accept-Encoding": "gzip, deflate",
+    "Accept": "application/json, text/html, application/xml, */*",
+})
 
 
 # ──────────────────────────────────────────────
-# 1. FETCH RECENT FORM 4 FILINGS VIA EFTS API
+# 1. FETCH RECENT FORM 4 FILINGS
+#    Using EDGAR full-text search (EFTS) API
+#    Docs: https://efts.sec.gov/LATEST/
 # ──────────────────────────────────────────────
 def fetch_form4_filings(lookback_days: int = 3) -> list[dict]:
     """
-    Uses EDGAR's EFTS (full-text search) API to find recent Form 4 filings.
-    Returns a list of dicts with accession numbers and filing URLs.
+    Uses EDGAR's EFTS full-text search API to find recent Form 4 filings.
+    Endpoint: https://efts.sec.gov/LATEST/search-index
+    Returns list of dicts with accession_no, cik, entity_name, file_date.
     """
-    start_date = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-    end_date = datetime.utcnow().strftime("%Y-%m-%d")
+    now = datetime.now(timezone.utc)
+    start_date = (now - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    end_date = now.strftime("%Y-%m-%d")
 
-    filings = []
-    start = 0
-    page_size = 100  # EFTS max per request
-
-    while True:
-        url = (
-            f"https://efts.sec.gov/LATEST/search-index?"
-            f"q=%224%22&forms=4&dateRange=custom"
-            f"&startdt={start_date}&enddt={end_date}"
-            f"&from={start}&size={page_size}"
-        )
-
-        log.info(f"Fetching EFTS results (offset {start})...")
-        try:
-            resp = SESSION.get(url, timeout=30)
-            time.sleep(REQUEST_DELAY)
-        except Exception as e:
-            log.error(f"EFTS request failed: {e}")
-            break
-
-        if resp.status_code != 200:
-            log.warning(f"EFTS returned HTTP {resp.status_code}, trying alternative approach")
-            break
-
-        try:
-            data = resp.json()
-        except Exception:
-            log.warning("EFTS returned non-JSON response, trying alternative approach")
-            break
-
-        hits = data.get("hits", {}).get("hits", [])
-        if not hits:
-            break
-
-        for hit in hits:
-            src = hit.get("_source", {})
-            acc = src.get("file_num", "") or hit.get("_id", "")
-            filings.append({
-                "accession": src.get("accession_no", ""),
-                "entity_name": src.get("entity_name", ""),
-                "file_date": src.get("file_date", ""),
-                "source": src,
-                "hit": hit,
-            })
-
-        total = data.get("hits", {}).get("total", {})
-        total_val = total.get("value", 0) if isinstance(total, dict) else total
-        start += page_size
-        if start >= total_val:
-            break
-
-    log.info(f"EFTS returned {len(filings)} Form 4 filings")
-    return filings
-
-
-def fetch_form4_filings_rss(lookback_days: int = 3) -> list[dict]:
-    """
-    Fallback: Uses EDGAR's RSS feed for recent Form 4 filings.
-    """
-    url = (
-        "https://www.sec.gov/cgi-bin/browse-edgar?"
-        "action=getcurrent&type=4&dateb=&owner=include&count=100"
-        "&search_text=&start=0&output=atom"
-    )
-    filings = []
-    log.info("Fetching Form 4 filings via RSS feed...")
-
-    try:
-        resp = SESSION.get(url, timeout=30)
-        time.sleep(REQUEST_DELAY)
-        if resp.status_code != 200:
-            log.error(f"RSS feed returned HTTP {resp.status_code}")
-            return filings
-
-        ns = {
-            "atom": "http://www.w3.org/2005/Atom",
-        }
-        root = ET.fromstring(resp.content)
-        cutoff = datetime.utcnow() - timedelta(days=lookback_days)
-
-        for entry in root.findall(".//atom:entry", ns):
-            title = entry.findtext("atom:title", "", ns)
-            if "4" not in title:
-                continue
-            link_el = entry.find("atom:link", ns)
-            link = link_el.get("href", "") if link_el is not None else ""
-            updated = entry.findtext("atom:updated", "", ns)
-
-            filings.append({
-                "title": title,
-                "link": link,
-                "updated": updated,
-            })
-
-        log.info(f"RSS returned {len(filings)} Form 4 entries")
-    except Exception as e:
-        log.error(f"RSS fetch failed: {e}")
-
-    return filings
-
-
-# ──────────────────────────────────────────────
-# 2. GET FILING INDEX PAGE & FIND XML URL
-# ──────────────────────────────────────────────
-def get_filing_documents(accession: str, cik: str = "") -> Optional[str]:
-    """
-    Given an accession number, fetch the filing index page and
-    find the primary XML document URL.
-    """
-    # Clean accession: remove dashes for URL path
-    acc_raw = accession.replace("-", "")
-    acc_dashed = accession
-
-    # Try to find the filing index
-    # Format: https://www.sec.gov/Archives/edgar/data/{CIK}/{ACC_NO_DASHES}/{ACC_DASHED}-index.htm
-    # Without CIK, we can use the accession-based URL
-    index_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_raw}/{acc_dashed}-index.htm" if cik else None
-
-    # Alternative: use the EDGAR filing viewer
-    viewer_url = f"https://www.sec.gov/cgi-bin/viewer?action=view&cik={cik}&type=4&dateb=&owner=include&count=1&search_text=&accession={acc_dashed}" if cik else None
-
-    # Most reliable: directly construct the filing page URL
-    if cik:
-        idx_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_raw}/{acc_dashed}-index.htm"
-        return _find_xml_on_index_page(idx_url)
-
-    return None
-
-
-def _find_xml_on_index_page(idx_url: str) -> Optional[str]:
-    """Fetch a filing index page and extract the XML document URL."""
-    try:
-        resp = SESSION.get(idx_url, timeout=30)
-        time.sleep(REQUEST_DELAY)
-        if resp.status_code != 200:
-            log.debug(f"Index page HTTP {resp.status_code}: {idx_url}")
-            return None
-
-        folder = idx_url.rsplit("/", 1)[0]
-        xml_links = re.findall(r'href="([^"]+\.xml)"', resp.text, re.IGNORECASE)
-
-        for link in xml_links:
-            basename = link.rsplit("/", 1)[-1] if "/" in link else link
-            if basename.lower().startswith("r_"):
-                continue
-            if link.startswith("http"):
-                return link
-            return f"{folder}/{link}"
-
-    except Exception as e:
-        log.debug(f"Error fetching index page {idx_url}: {e}")
-    return None
-
-
-# ──────────────────────────────────────────────
-# 3. ALTERNATIVE: SCRAPE RECENT FILINGS DIRECTLY
-# ──────────────────────────────────────────────
-def fetch_form4_via_fulltext_search(lookback_days: int = 3) -> list[dict]:
-    """
-    Uses EDGAR full-text search (EFTS) REST API — the most reliable method.
-    Returns filing metadata with direct links to documents.
-    """
-    start_date = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-    end_date = datetime.utcnow().strftime("%Y-%m-%d")
-
-    url = (
-        f"https://efts.sec.gov/LATEST/search-index?"
-        f"q=%224%22&forms=4&dateRange=custom"
-        f"&startdt={start_date}&enddt={end_date}"
-    )
-    # Actually, let's use the better-documented endpoint:
-    url = (
-        f"https://efts.sec.gov/LATEST/search-index?"
-        f"forms=4&dateRange=custom"
-        f"&startdt={start_date}&enddt={end_date}"
-    )
-
-    try:
-        resp = SESSION.get(url, timeout=30)
-        time.sleep(REQUEST_DELAY)
-        if resp.status_code == 200:
-            return resp.json().get("hits", {}).get("hits", [])
-    except Exception as e:
-        log.error(f"Full-text search failed: {e}")
-    return []
-
-
-def fetch_form4_robust(lookback_days: int = 3) -> list[str]:
-    """
-    Most robust approach: use EDGAR's company search to get recent Form 4
-    filing index pages, then extract XML URLs from each.
-    
-    Returns a list of XML document URLs ready to parse.
-    """
-    xml_urls = []
-    start_date = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-    end_date = datetime.utcnow().strftime("%Y-%m-%d")
-
-    # Step 1: Use EDGAR full-text search to get filing accessions
-    log.info(f"Searching EDGAR for Form 4 filings from {start_date} to {end_date}...")
-    
-    base_url = "https://efts.sec.gov/LATEST/search-index"
+    # The documented EFTS endpoint
+    url = "https://efts.sec.gov/LATEST/search-index"
     params = {
+        "q": '"4"',
         "forms": "4",
         "dateRange": "custom",
         "startdt": start_date,
         "enddt": end_date,
     }
 
-    offset = 0
-    page_size = 50
-    total_found = 0
-
-    while True:
-        params["from"] = offset
-        params["size"] = page_size
-
-        try:
-            resp = SESSION.get(base_url, params=params, timeout=30)
-            time.sleep(REQUEST_DELAY)
-        except Exception as e:
-            log.error(f"Search request failed: {e}")
-            break
-
-        if resp.status_code != 200:
-            log.warning(f"Search returned HTTP {resp.status_code}")
-            # Fall back to RSS approach
-            break
-
-        try:
+    log.info(f"Trying EFTS search: {url}")
+    try:
+        resp = SESSION.get(url, params=params, timeout=30)
+        time.sleep(REQUEST_DELAY)
+        log.info(f"EFTS response: HTTP {resp.status_code}")
+        if resp.status_code == 200:
             data = resp.json()
-        except Exception:
-            log.warning("Non-JSON search response")
-            break
+            hits = data.get("hits", {}).get("hits", [])
+            log.info(f"EFTS returned {len(hits)} hits")
+            return hits
+    except Exception as e:
+        log.warning(f"EFTS search failed: {e}")
 
-        hits = data.get("hits", {}).get("hits", [])
-        if not hits:
-            break
+    return []
 
-        total_raw = data.get("hits", {}).get("total", 0)
-        total_count = total_raw.get("value", 0) if isinstance(total_raw, dict) else total_raw
 
-        for hit in hits:
-            src = hit.get("_source", {})
-            acc = src.get("accession_no", "")
-            cik = str(src.get("cik", "")).lstrip("0")
-            
-            if acc and cik:
-                acc_clean = acc.replace("-", "")
-                idx_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_clean}/{acc}-index.htm"
-                xml_url = _find_xml_on_index_page(idx_url)
-                if xml_url:
-                    xml_urls.append(xml_url)
-                    total_found += 1
-                else:
-                    log.warning(f"No XML found for accession {acc} (CIK {cik})")
+def fetch_form4_via_full_index(lookback_days: int = 3) -> list[dict]:
+    """
+    Fallback: Download EDGAR daily full-index master files to find Form 4s.
+    These are plain text files with one line per filing.
+    URL format: https://www.sec.gov/Archives/edgar/full-index/YYYY/QTRN/master.idx
+    """
+    now = datetime.now(timezone.utc)
+    filings = []
 
-            if total_found % 25 == 0 and total_found > 0:
-                log.info(f"  Resolved {total_found} XML URLs so far...")
+    for day_offset in range(lookback_days + 1):
+        d = now - timedelta(days=day_offset)
+        quarter = (d.month - 1) // 3 + 1
 
-        offset += page_size
-        if offset >= total_count or offset >= 500:
-            # Cap at 500 to avoid excessive requests
-            break
+        # Try the daily master file first
+        # Format varies: master.YYYYMMDD.idx or just in the full master.idx
+        # The full master.idx for the quarter contains ALL filings
+        # For daily, EDGAR provides files at:
+        #   /Archives/edgar/daily-index/YYYY/QTRN/master.YYYYMMDD.idx
+        daily_url = (
+            f"https://www.sec.gov/Archives/edgar/daily-index/"
+            f"{d.year}/QTR{quarter}/master.{d.strftime('%Y%m%d')}.idx"
+        )
 
-    log.info(f"Resolved {len(xml_urls)} Form 4 XML URLs total")
-    return xml_urls
+        log.info(f"Fetching daily index: {daily_url}")
+        try:
+            resp = SESSION.get(daily_url, timeout=30)
+            time.sleep(REQUEST_DELAY)
+            if resp.status_code == 200:
+                for line in resp.text.splitlines():
+                    # Format: CIK|Company Name|Form Type|Date Filed|Filename
+                    parts = line.split("|")
+                    if len(parts) == 5 and parts[2].strip() in ("4", "4/A"):
+                        filings.append({
+                            "cik": parts[0].strip(),
+                            "company_name": parts[1].strip(),
+                            "form_type": parts[2].strip(),
+                            "date_filed": parts[3].strip(),
+                            "filename": parts[4].strip(),
+                        })
+                log.info(f"  Found {len([p for p in filings if p['date_filed'] == d.strftime('%Y-%m-%d')])} Form 4s for {d.strftime('%Y-%m-%d')}")
+            else:
+                log.info(f"  No daily index for {d.strftime('%Y-%m-%d')} (HTTP {resp.status_code})")
+        except Exception as e:
+            log.warning(f"  Error fetching daily index: {e}")
+
+    log.info(f"Full-index method found {len(filings)} total Form 4 filings")
+    return filings
 
 
 # ──────────────────────────────────────────────
-# 4. PARSE FORM 4 XML FOR PURCHASE DETAILS
+# 2. RESOLVE XML URLS FROM FILING METADATA
+# ──────────────────────────────────────────────
+def resolve_xml_url_from_index_entry(filing: dict) -> Optional[str]:
+    """
+    Given a filing from the daily index, construct the filing index page URL
+    and find the XML document.
+
+    The filename field looks like: edgar/data/789019/0001062993-26-003456.txt
+    We need: https://www.sec.gov/Archives/edgar/data/789019/000106299326003456/0001062993-26-003456-index.htm
+    """
+    filename = filing.get("filename", "")
+    if not filename:
+        return None
+
+    # Build the full URL to the txt filing
+    base = "https://www.sec.gov/Archives/"
+
+    # Extract accession number from filename
+    # e.g., edgar/data/789019/0001062993-26-003456.txt
+    parts = filename.split("/")
+    if len(parts) < 4:
+        return None
+
+    cik = parts[2]
+    txt_name = parts[3]  # 0001062993-26-003456.txt
+    accession_dashed = txt_name.replace(".txt", "")
+    accession_nodash = accession_dashed.replace("-", "")
+
+    # Filing index page URL
+    idx_url = f"{base}edgar/data/{cik}/{accession_nodash}/{accession_dashed}-index.htm"
+
+    return _find_xml_on_index_page(idx_url, f"{base}edgar/data/{cik}/{accession_nodash}")
+
+
+def _find_xml_on_index_page(idx_url: str, folder_url: str) -> Optional[str]:
+    """Fetch a filing index page and extract the primary XML document URL."""
+    try:
+        resp = SESSION.get(idx_url, timeout=30)
+        time.sleep(REQUEST_DELAY)
+
+        if resp.status_code != 200:
+            log.debug(f"Index page HTTP {resp.status_code}: {idx_url}")
+            return None
+
+        # Look for XML file links in the index page
+        xml_links = re.findall(r'href="([^"]+\.xml)"', resp.text, re.IGNORECASE)
+
+        if not xml_links:
+            # Sometimes the XML is referenced differently
+            # Try looking for any .xml reference in the page
+            xml_links = re.findall(r'([^\s"<>]+\.xml)', resp.text, re.IGNORECASE)
+
+        for link in xml_links:
+            basename = link.rsplit("/", 1)[-1] if "/" in link else link
+            # Skip R_ files (XBRL rendering files) and FilingSummary
+            if basename.lower().startswith("r_"):
+                continue
+            if "filingsummary" in basename.lower():
+                continue
+            if link.startswith("http"):
+                return link
+            if link.startswith("/"):
+                return f"https://www.sec.gov{link}"
+            return f"{folder_url}/{link}"
+
+    except Exception as e:
+        log.debug(f"Error fetching index page: {e}")
+    return None
+
+
+# ──────────────────────────────────────────────
+# 3. PARSE FORM 4 XML FOR PURCHASE DETAILS
 # ──────────────────────────────────────────────
 def parse_form4_xml(xml_url: str) -> Optional[dict]:
     """
     Downloads and parses a Form 4 XML filing.
-    Returns a dict with insider + transaction info if it contains
-    open-market purchases above the minimum threshold.
+    Returns purchase info if it contains open-market purchases
+    above the minimum threshold. Returns None otherwise.
     """
     try:
         resp = SESSION.get(xml_url, timeout=30)
@@ -337,19 +231,21 @@ def parse_form4_xml(xml_url: str) -> Optional[dict]:
         if resp.status_code != 200:
             return None
 
-        # Some Form 4 XMLs have namespace declarations — strip them
         content = resp.content
+        # Strip XML namespaces that can break ElementTree
         try:
             root = ET.fromstring(content)
         except ET.ParseError:
-            # Try stripping XML namespace
             clean = re.sub(rb'\sxmlns[^"]*"[^"]*"', b'', content)
-            root = ET.fromstring(clean)
+            try:
+                root = ET.fromstring(clean)
+            except ET.ParseError:
+                return None
     except Exception as e:
-        log.debug(f"Failed to parse {xml_url}: {e}")
+        log.debug(f"Failed to fetch/parse {xml_url}: {e}")
         return None
 
-    # --- Extract issuer (company) info ---
+    # --- Issuer (company) info ---
     issuer_name = _text(root, ".//issuerName") or _text(root, ".//issuer/issuerName")
     issuer_ticker = _text(root, ".//issuerTradingSymbol") or _text(root, ".//issuer/issuerTradingSymbol")
     issuer_cik = _text(root, ".//issuerCik") or _text(root, ".//issuer/issuerCik")
@@ -357,7 +253,7 @@ def parse_form4_xml(xml_url: str) -> Optional[dict]:
     if not issuer_name:
         return None
 
-    # --- Extract reporting owner (insider) info ---
+    # --- Reporting owner (insider) info ---
     owner_name = _text(root, ".//rptOwnerName") or _text(root, ".//reportingOwner//rptOwnerName")
 
     rel = root.find(".//reportingOwnerRelationship")
@@ -377,7 +273,7 @@ def parse_form4_xml(xml_url: str) -> Optional[dict]:
         roles.append("10%+ Owner")
     role_str = ", ".join(roles) if roles else "Insider"
 
-    # --- Extract non-derivative transactions (P = open market purchase) ---
+    # --- Non-derivative transactions: look for code "P" (purchase) ---
     purchases = []
     for txn in root.findall(".//nonDerivativeTransaction"):
         code = _text(txn, ".//transactionCode") or _text(txn, ".//transactionCoding/transactionCode")
@@ -441,15 +337,15 @@ def _text(el, path: str) -> str:
 
 
 # ──────────────────────────────────────────────
-# 5. BUILD + SEND EMAIL DIGEST
+# 4. BUILD + SEND EMAIL DIGEST
 # ──────────────────────────────────────────────
 def build_email_html(trades: list[dict], date_str: str) -> str:
-    """Build a clean HTML email from a list of parsed insider purchases."""
+    """Build a clean HTML email digest."""
     if not trades:
         return f"""
         <html><body style="font-family: Arial, sans-serif; color: #333;">
         <h2 style="color: #1a5276;">Insider Buying Digest &mdash; {date_str}</h2>
-        <p>No sizeable open-market insider purchases were filed in the last 3 days
+        <p>No sizeable open-market insider purchases were filed recently
         (min threshold: ${MIN_PURCHASE_USD:,.0f}).</p>
         </body></html>
         """
@@ -459,9 +355,6 @@ def build_email_html(trades: list[dict], date_str: str) -> str:
     rows = ""
     for t in trades:
         ticker_link = f"https://finance.yahoo.com/quote/{t['ticker']}"
-        # Build SEC filing link (go to human-readable page)
-        sec_link = t["filing_url"].replace(".xml", "-index.htm") if t["filing_url"] else "#"
-
         rows += f"""
         <tr style="border-bottom: 1px solid #eee;">
             <td style="padding: 10px;">
@@ -474,8 +367,6 @@ def build_email_html(trades: list[dict], date_str: str) -> str:
             <td style="padding: 10px; text-align: right;">${t['avg_price']:,.2f}</td>
             <td style="padding: 10px; text-align: right; font-weight: bold; color: #27ae60;">
                 ${t['total_invested']:,.0f}</td>
-            <td style="padding: 10px; text-align: center;">
-                <a href="{sec_link}" style="color: #2980b9; font-size: 12px;">Filing</a></td>
         </tr>
         """
 
@@ -498,7 +389,6 @@ def build_email_html(trades: list[dict], date_str: str) -> str:
                 <th style="padding: 10px; text-align: right;">Shares</th>
                 <th style="padding: 10px; text-align: right;">Avg Price</th>
                 <th style="padding: 10px; text-align: right;">Total Value</th>
-                <th style="padding: 10px; text-align: center;">Source</th>
             </tr>
         </thead>
         <tbody>{rows}</tbody>
@@ -533,46 +423,77 @@ def send_email(html_body: str, date_str: str):
 
 
 # ──────────────────────────────────────────────
-# 6. MAIN PIPELINE
+# 5. MAIN PIPELINE
 # ──────────────────────────────────────────────
 def main():
     log.info("=== Insider Buying Alert Agent ===")
     log.info(f"Min purchase threshold: ${MIN_PURCHASE_USD:,.0f}")
+    log.info(f"User-Agent: {EDGAR_USER_AGENT}")
 
-    # Step 1: Get all Form 4 XML URLs from the last 3 days
-    xml_urls = fetch_form4_robust(lookback_days=3)
+    # ── Step 1: Get Form 4 filing list from daily index files ──
+    # This is the most reliable method — plain text files, no API auth needed
+    filings = fetch_form4_via_full_index(lookback_days=3)
 
-    if not xml_urls:
-        log.warning("Primary search returned no results. Trying RSS fallback...")
-        rss_filings = fetch_form4_filings_rss(lookback_days=3)
-        for f in rss_filings:
-            link = f.get("link", "")
-            if link:
-                xml_url = _find_xml_on_index_page(link)
-                if xml_url:
-                    xml_urls.append(xml_url)
+    if not filings:
+        log.warning("Daily index returned no filings. Trying EFTS search as fallback...")
+        efts_hits = fetch_form4_filings(lookback_days=3)
+        # Convert EFTS hits to a common format for processing
+        for hit in efts_hits:
+            src = hit.get("_source", {})
+            acc = src.get("accession_no", "")
+            cik = str(src.get("cik", "")).lstrip("0")
+            if acc and cik:
+                acc_nodash = acc.replace("-", "")
+                filings.append({
+                    "cik": cik,
+                    "company_name": src.get("entity_name", ""),
+                    "form_type": "4",
+                    "date_filed": src.get("file_date", ""),
+                    "filename": f"edgar/data/{cik}/{acc}.txt",
+                })
 
-    if not xml_urls:
-        log.info("No Form 4 XML documents found. Sending empty digest.")
-        date_str = datetime.utcnow().strftime("%B %d, %Y")
+    if not filings:
+        log.info("No Form 4 filings found from any source. Sending empty digest.")
+        date_str = datetime.now(timezone.utc).strftime("%B %d, %Y")
         send_email(build_email_html([], date_str), date_str)
         return
 
-    log.info(f"Processing {len(xml_urls)} Form 4 XML documents...")
+    # ── Step 2: Resolve XML URLs from filing index pages ──
+    log.info(f"Resolving XML URLs for {len(filings)} Form 4 filings...")
+    xml_urls = []
+    for i, f in enumerate(filings):
+        xml_url = resolve_xml_url_from_index_entry(f)
+        if xml_url:
+            xml_urls.append(xml_url)
+        else:
+            log.debug(f"No XML found for {f.get('company_name', '?')} ({f.get('filename', '?')})")
 
+        if (i + 1) % 100 == 0:
+            log.info(f"  Resolved {i+1}/{len(filings)} filings → {len(xml_urls)} XMLs so far")
+
+    log.info(f"Resolved {len(xml_urls)} XML URLs from {len(filings)} filings")
+
+    if not xml_urls:
+        log.warning("Could not resolve any XML URLs. Sending empty digest.")
+        date_str = datetime.now(timezone.utc).strftime("%B %d, %Y")
+        send_email(build_email_html([], date_str), date_str)
+        return
+
+    # ── Step 3: Parse each XML for qualifying purchases ──
+    log.info(f"Parsing {len(xml_urls)} Form 4 XMLs for purchases >= ${MIN_PURCHASE_USD:,.0f}...")
     insider_purchases = []
     for i, url in enumerate(xml_urls):
         result = parse_form4_xml(url)
         if result:
             insider_purchases.append(result)
-            log.info(f"  PURCHASE: {result['ticker']} — {result['owner_name']} "
-                     f"— ${result['total_invested']:,.0f}")
+            log.info(f"  ✓ PURCHASE: {result['ticker']} | {result['owner_name']} | "
+                     f"{result['role']} | ${result['total_invested']:,.0f}")
 
-        if (i + 1) % 50 == 0:
-            log.info(f"  Processed {i+1}/{len(xml_urls)}, "
-                     f"found {len(insider_purchases)} purchases...")
+        if (i + 1) % 100 == 0:
+            log.info(f"  Parsed {i+1}/{len(xml_urls)}, "
+                     f"found {len(insider_purchases)} qualifying purchases...")
 
-    # Deduplicate by (ticker, owner_name)
+    # ── Step 4: Deduplicate and send ──
     seen = set()
     unique = []
     for t in insider_purchases:
@@ -582,12 +503,11 @@ def main():
             unique.append(t)
     insider_purchases = unique
 
-    log.info(f"Found {len(insider_purchases)} unique insider purchases >= ${MIN_PURCHASE_USD:,.0f}")
+    log.info(f"Total: {len(insider_purchases)} unique insider purchases >= ${MIN_PURCHASE_USD:,.0f}")
 
-    date_str = datetime.utcnow().strftime("%B %d, %Y")
+    date_str = datetime.now(timezone.utc).strftime("%B %d, %Y")
     html = build_email_html(insider_purchases, date_str)
     send_email(html, date_str)
-
     log.info("Done!")
 
 
