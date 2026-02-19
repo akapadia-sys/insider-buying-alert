@@ -29,4 +29,4 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
           MIN_PURCHASE_USD: "250000"
-          EDGAR_USER_AGENT: "InsiderBuyingAlert/1.0 (insider-alert@users.noreply.github.com)"
+          EDGAR_USER_AGENT: "AkarisGlobal aman@akarisglobal.com"
