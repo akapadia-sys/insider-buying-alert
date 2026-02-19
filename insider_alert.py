@@ -272,13 +272,15 @@ def get_form4_xml_url(filing: dict) -> Optional[str]:
         if not xml_links:
             return None
         
-        # Pick the primary XML (usually the first non-R_ file)
+        # Pick the best XML: skip R_ report files, prefer the primary doc
+        folder = idx_page.rsplit("/", 1)[0]
         for link in xml_links:
-            if not link.startswith("R_") and "primary_doc" not in link:
-                if link.startswith("http"):
-                    return link
-                folder = idx_page.rsplit("/", 1)[0]
-                return f"{folder}/{link}"
+            basename = link.rsplit("/", 1)[-1] if "/" in link else link
+            if basename.lower().startswith("r_"):
+                continue
+            if link.startswith("http"):
+                return link
+            return f"{folder}/{link}"
         
         return None
     except Exception as e:
@@ -380,7 +382,7 @@ def main():
     log.info("=== Insider Buying Alert Agent ===")
     log.info(f"Min purchase threshold: ${MIN_PURCHASE_USD:,.0f}")
 
-    # Fetch yesterday's + today's filings (filings can appear with a lag)
+    # Fetch last 3 days of filings to catch weekends + holidays
     filings = fetch_recent_form4_index(lookback_days=3)
 
     if not filings:
@@ -397,6 +399,7 @@ def main():
     for f in filings:
         xml_url = get_form4_xml_url(f)
         if not xml_url:
+            log.warning(f"Could not resolve XML URL for: {f['company_name']} (CIK {f['cik']}, file: {f['filename']})")
             continue
         
         result = parse_form4_xml(xml_url)
