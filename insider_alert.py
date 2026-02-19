@@ -49,31 +49,40 @@ def fetch_insider_purchases(lookback_days: int = 3) -> list[dict]:
     
     URL: http://openinsider.com/latest-insider-purchases
     """
-    # This page shows the ~100 most recent insider purchases
-    # No finicky screener parameters needed
-    urls_to_try = [
-        "http://openinsider.com/latest-insider-purchases",
-        "http://openinsider.com/screener?s=&o=&pl=&ph=&st=1&td=7&tdr=&fdlyl=&fdlyh=&dtefrom=&dteto=&xp=1&vl=&vh=&ocl=&och=&session=1&sic1=-1&sicl=100&sich=9999&grp=0&nfl=&nfh=&nil=&nih=&nol=&noh=&v2l=&v2h=&oc2l=&oc2h=&sortcol=0&cnt=500&page=1",
+    # Fetch from multiple pages and merge results for better coverage.
+    # Page 1: latest purchases (~100 most recent)
+    # Page 2: screener with cnt=500 for broader coverage
+    urls = [
+        ("latest-purchases", "http://openinsider.com/latest-insider-purchases"),
+        ("screener-page-1", "http://openinsider.com/screener?s=&o=&pl=&ph=&st=1&td=7&tdr=&fdlyl=&fdlyh=&dtefrom=&dteto=&xp=1&vl=&vh=&ocl=&och=&session=1&sic1=-1&sicl=100&sich=9999&grp=0&nfl=&nfh=&nil=&nih=&nol=&noh=&v2l=&v2h=&oc2l=&oc2h=&sortcol=0&cnt=500&page=1"),
     ]
 
-    for url in urls_to_try:
-        log.info(f"Fetching: {url}")
+    all_purchases = []
+    seen_keys = set()
+
+    for label, url in urls:
+        log.info(f"Fetching [{label}]: {url}")
         try:
             resp = SESSION.get(url, timeout=30)
             if resp.status_code != 200:
-                log.warning(f"HTTP {resp.status_code} from {url}")
+                log.warning(f"  HTTP {resp.status_code}")
                 continue
         except Exception as e:
-            log.warning(f"Request failed for {url}: {e}")
+            log.warning(f"  Request failed: {e}")
             continue
 
-        purchases = parse_openinsider_table(resp.text)
-        if purchases:
-            return purchases
-        log.warning(f"No purchases parsed from {url}, trying next...")
+        page_purchases = parse_openinsider_table(resp.text)
+        log.info(f"  [{label}] returned {len(page_purchases)} purchases")
 
-    log.error("All sources failed")
-    return []
+        # Merge, deduplicating by (ticker, insider)
+        for p in page_purchases:
+            key = (p["ticker"], p["owner_name"])
+            if key not in seen_keys:
+                seen_keys.add(key)
+                all_purchases.append(p)
+
+    log.info(f"Combined total: {len(all_purchases)} unique purchases across all pages")
+    return all_purchases
 
 
 def parse_openinsider_table(html: str) -> list[dict]:
@@ -330,13 +339,14 @@ def main():
     for t in purchases:
         fd = t.get("filing_date", "")
         try:
-            filed_dt = datetime.strptime(fd, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            # Handle both "YYYY-MM-DD" and "YYYY-MM-DD HH:MM:SS" formats
+            fd_clean = fd.strip()[:10]  # Take just the date part
+            filed_dt = datetime.strptime(fd_clean, "%Y-%m-%d").replace(tzinfo=timezone.utc)
             if filed_dt >= cutoff:
                 filtered.append(t)
             else:
                 log.info(f"  Skipping (filed {fd}): {t['ticker']} | {t['owner_name']} | ${t['total_invested']:,.0f}")
         except ValueError:
-            # Can't parse date — log it and include anyway
             log.warning(f"  Unparseable filing date '{fd}' for {t['ticker']} | {t['owner_name']} — including")
             filtered.append(t)
     
