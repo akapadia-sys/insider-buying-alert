@@ -6,6 +6,8 @@ on:
     # That's roughly 7 PM ET / 4 PM PT (after market close)
     - cron: '0 23 * * 1-5'
   workflow_dispatch:  # Lets you run it manually for testing
+  permissions:
+    contents: write
 
 jobs:
   send-alert:
@@ -29,3 +31,12 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
           MIN_PURCHASE_USD: "250000"
+
+      - name: Keep workflow alive
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          date > .last-run
+          git add .last-run
+          git diff --staged --quiet || git commit -m "Keep alive $(date -u +%Y-%m-%d)"
+          git push
