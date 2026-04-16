@@ -6,8 +6,8 @@ on:
     # That's roughly 7 PM ET / 4 PM PT (after market close)
     - cron: '0 23 * * 1-5'
   workflow_dispatch:  # Lets you run it manually for testing
-  permissions:
-    contents: write
+permissions:
+  contents: write
 
 jobs:
   send-alert:
