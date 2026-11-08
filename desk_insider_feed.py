@@ -174,10 +174,18 @@ def send(subject: str, body: str):
     msg["Subject"] = subject
     msg["From"] = GMAIL_ADDRESS
     msg["To"] = DESK_RECIPIENT
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(GMAIL_ADDRESS, GMAIL_APP_PASS)
-        server.sendmail(GMAIL_ADDRESS, DESK_RECIPIENT, msg.as_string())
-    log.info(f"Sent to {DESK_RECIPIENT}")
+    for attempt in range(1, 4):
+        try:
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=60) as server:
+                server.login(GMAIL_ADDRESS, GMAIL_APP_PASS)
+                server.sendmail(GMAIL_ADDRESS, DESK_RECIPIENT, msg.as_string())
+            log.info(f"Sent to {DESK_RECIPIENT}")
+            return
+        except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError, OSError) as e:
+            log.warning(f"Send attempt {attempt} failed: {e}")
+            if attempt == 3:
+                raise
+            time.sleep(30)
 
 
 def main():
