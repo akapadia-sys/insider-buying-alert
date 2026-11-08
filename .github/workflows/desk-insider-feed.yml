@@ -1,0 +1,28 @@
+name: Desk Insider Feed
+
+on:
+  schedule:
+    # 22:07 UTC weekdays = 5:07pm ET in winter, 6:07pm ET in summer.
+    # Lands in the desk inbox before the ~6:41pm ET evening desk run.
+    - cron: '7 22 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  feed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests beautifulsoup4
+      - name: Send desk insider feed
+        run: python desk_insider_feed.py
+        env:
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          DESK_RECIPIENT: aman-2043@agentmail.to
+          # Live US Form 4 filers. TSM, ASML, SPOT and KSPI are foreign filers
+          # (no Form 4s); the desk checks those through 6-Ks and local disclosure.
+          DESK_TICKERS: "MELI SPGI AMZN GOOGL GOOG ARE MU DHI MRVI NVDA CACI LRCX NOW TMO SWIM KKR"
+          LOOKBACK_DAYS: "3"
